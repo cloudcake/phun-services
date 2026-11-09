@@ -1,0 +1,120 @@
+# Builds Valkey for macOS (Apple Silicon and Intel) from the upstream source
+# tarball and publishes it on a release Phun setup downloads from. Upstream
+# ships Linux tarballs only; Phun takes Linux from download.valkey.io and
+# Windows from a community build, so this covers the two Macs.
+#
+# Manual only: run it from the Actions tab. Afterwards run Phun's
+# `scripts/pin-services.sh valkey-<version>`.
+name: valkey-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Valkey version
+        default: "9.1.3"
+      sha256:
+        description: SHA-256 of the GitHub source tarball (refs/tags/<version>.tar.gz)
+        default: "184e34ed2d9b51879b682b5b15205e2b9d677c60280e3cb453be8f520d04e293"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: valkey ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ inputs.version }}
+      # Oldest macOS the binaries run on; the runners themselves are newer.
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - name: Source (checked)
+        run: |
+          curl -fsSL --retry 3 -o valkey.tar.gz "https://github.com/valkey-io/valkey/archive/refs/tags/$VERSION.tar.gz"
+          echo "${{ inputs.sha256 }}  valkey.tar.gz" | shasum -a 256 -c -
+          tar -xzf valkey.tar.gz
+
+      # No TLS (Phun listens on loopback only), so nothing links OpenSSL and
+      # the binaries need only what every Mac has.
+      - name: Build
+        working-directory: valkey-${{ inputs.version }}
+        run: make -j"$(sysctl -n hw.ncpu)" BUILD_TLS=no USE_SYSTEMD=no
+
+      - name: Stage
+        run: |
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage/bin"
+          for tool in valkey-server valkey-cli valkey-benchmark; do
+            cp "valkey-$VERSION/src/$tool" "$stage/bin/$tool"
+          done
+          ln -s valkey-server "$stage/bin/redis-server"
+          ln -s valkey-cli "$stage/bin/redis-cli"
+          chmod 755 "$stage"/bin/valkey-*
+
+      - name: Verify
+        run: |
+          bin="$RUNNER_TEMP/stage/bin"
+          "$bin/valkey-server" --version | grep -q "v=$VERSION"
+          for tool in valkey-server valkey-cli; do
+            otool -L "$bin/$tool"
+            if otool -L "$bin/$tool" | tail -n +2 | grep -vE '^\s+/(usr/lib|System/Library)/'; then
+              echo "$tool links a library outside macOS"; exit 1
+            fi
+          done
+          "$bin/valkey-server" --port 16399 --bind 127.0.0.1 --save "" --daemonize yes --pidfile "$RUNNER_TEMP/v.pid"
+          for _ in $(seq 1 20); do "$bin/valkey-cli" -p 16399 ping 2>/dev/null | grep -q PONG && break; sleep 0.5; done
+          "$bin/valkey-cli" -p 16399 ping | grep -q PONG
+          "$bin/valkey-cli" -p 16399 shutdown nosave || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          name="valkey-$VERSION-${{ matrix.platform }}.tar.gz"
+          tar -C "$RUNNER_TEMP/stage" -czf "dist/$name" bin
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: valkey-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd dist
+          tag="valkey-$VERSION"
+          files=(valkey-"$VERSION"-*.tar.gz)
+          [ "${#files[@]}" -eq 2 ] || { echo "$tag: expected 2 archives, got ${#files[@]}"; exit 1; }
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            echo "$tag already exists on $REPO; delete it first to rebuild"; exit 1
+          fi
+          gh release create "$tag" --repo "$REPO" --title "Valkey $VERSION for macOS" \
+            --notes "Valkey $VERSION for Phun on macOS (Apple Silicon and Intel), built from the upstream source without TLS. BSD-3-Clause." \
+            "${files[@]}" SHA256SUMS

@@ -1,0 +1,165 @@
+# Builds MariaDB for macOS (Apple Silicon and Intel) from the upstream source
+# and publishes it on a release Phun setup downloads from. MariaDB publishes
+# Linux and Windows builds only; Phun takes those from archive.mariadb.org.
+#
+# The build bundles its SSL (WolfSSL), PCRE2 and zlib and leaves out the
+# storage engines that need outside libraries (Mroonga, RocksDB, Connect,
+# OQGraph, Spider, ColumnStore, S3), so the server needs only what macOS
+# ships. The archive mirrors the Linux bintar: bin/, lib/, share/ and scripts/.
+#
+# Manual only: run it from the Actions tab. Afterwards run Phun's
+# `scripts/pin-services.sh mariadb-<version>`.
+name: mariadb-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: MariaDB version
+        default: "11.8.9"
+      sha256:
+        description: SHA-256 of mariadb-<version>.tar.gz (archive.mariadb.org source/sha256sums.txt)
+        default: "2e015b7e91004142eda8b3a20d3ceb875cf2ae55e72603e7222cd497d4e56fc6"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: mariadb ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ inputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - name: Source (checked)
+        run: |
+          curl -fsSL --retry 3 -o mariadb.tar.gz "https://archive.mariadb.org/mariadb-$VERSION/source/mariadb-$VERSION.tar.gz"
+          echo "${{ inputs.sha256 }}  mariadb.tar.gz" | shasum -a 256 -c -
+          tar -xzf mariadb.tar.gz
+
+      # Build tools only: bison (macOS's is too old) and cmake. Homebrew's
+      # prefix is kept out of library lookup so nothing links its dylibs.
+      - name: Tools
+        run: brew install bison cmake
+
+      - name: Configure
+        run: |
+          prefix="$(brew --prefix)"
+          cmake -S "mariadb-$VERSION" -B build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
+            -DCMAKE_IGNORE_PREFIX_PATH="$prefix;/usr/local;/opt/local" \
+            -DBISON_EXECUTABLE="$(brew --prefix bison)/bin/bison" \
+            -DWITH_SSL=bundled \
+            -DWITH_PCRE=bundled \
+            -DWITH_ZLIB=bundled \
+            -DWITH_LIBFMT=bundled \
+            -DWITH_UNIT_TESTS=OFF \
+            -DWITH_EMBEDDED_SERVER=OFF \
+            -DWITHOUT_SERVER=OFF \
+            -DPLUGIN_MROONGA=NO \
+            -DPLUGIN_ROCKSDB=NO \
+            -DPLUGIN_CONNECT=NO \
+            -DPLUGIN_OQGRAPH=NO \
+            -DPLUGIN_SPIDER=NO \
+            -DPLUGIN_COLUMNSTORE=NO \
+            -DPLUGIN_S3=NO \
+            -DPLUGIN_PROVIDER_LZ4=NO \
+            -DPLUGIN_PROVIDER_LZO=NO \
+            -DPLUGIN_PROVIDER_LZMA=NO \
+            -DPLUGIN_PROVIDER_SNAPPY=NO \
+            -DPLUGIN_PROVIDER_BZIP2=NO \
+            -DPLUGIN_PROVIDER_ZSTD=NO \
+            -DINSTALL_LAYOUT=STANDALONE
+
+      - name: Build
+        run: cmake --build build --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Install
+        run: cmake --install build
+
+      - name: Stage
+        run: |
+          src="$RUNNER_TEMP/install"
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage"
+          for dir in bin lib share scripts; do
+            [ -d "$src/$dir" ] && cp -R "$src/$dir" "$stage/$dir"
+          done
+          rm -rf "$stage/lib/pkgconfig" "$stage/share/man" "$stage/mysql-test" "$stage/sql-bench"
+          ls "$stage" "$stage/bin" | head -80
+
+      - name: Verify
+        run: |
+          stage="$RUNNER_TEMP/stage"
+          "$stage/bin/mariadbd" --version | grep -q "$VERSION"
+          for binary in "$stage/bin/mariadbd" "$stage/bin/mariadb" "$stage/bin/mariadb-dump"; do
+            otool -L "$binary"
+            if otool -L "$binary" | tail -n +2 | grep -vE '^\s+(/usr/lib|/System/Library|@rpath|@loader_path|@executable_path)/'; then
+              echo "$binary links a library outside macOS"; exit 1
+            fi
+          done
+          data="$RUNNER_TEMP/data"
+          "$stage/scripts/mariadb-install-db" --no-defaults --basedir="$stage" --datadir="$data" \
+            --auth-root-authentication-method=normal --skip-test-db
+          "$stage/bin/mariadbd" --no-defaults --basedir="$stage" --datadir="$data" \
+            --port=13399 --bind-address=127.0.0.1 --socket="$RUNNER_TEMP/m.sock" --skip-grant-tables &
+          for _ in $(seq 1 60); do
+            "$stage/bin/mariadb" --no-defaults -h127.0.0.1 -P13399 -uroot -e 'select version()' 2>/dev/null && break
+            sleep 1
+          done
+          "$stage/bin/mariadb" --no-defaults -h127.0.0.1 -P13399 -uroot -e 'create database phun_check; show databases' | grep -q phun_check
+          "$stage/bin/mariadb-admin" --no-defaults -h127.0.0.1 -P13399 -uroot shutdown
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          name="mariadb-$VERSION-${{ matrix.platform }}.tar.gz"
+          tar -C "$RUNNER_TEMP/stage" -czf "dist/$name" bin lib share scripts
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mariadb-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd dist
+          tag="mariadb-$VERSION"
+          files=(mariadb-"$VERSION"-*.tar.gz)
+          [ "${#files[@]}" -eq 2 ] || { echo "$tag: expected 2 archives, got ${#files[@]}"; exit 1; }
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            echo "$tag already exists on $REPO; delete it first to rebuild"; exit 1
+          fi
+          gh release create "$tag" --repo "$REPO" --title "MariaDB $VERSION for macOS" \
+            --notes "MariaDB $VERSION for Phun on macOS (Apple Silicon and Intel), built from the upstream source with bundled SSL, PCRE2 and zlib. GPL-2.0." \
+            "${files[@]}" SHA256SUMS

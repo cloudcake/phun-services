@@ -1,0 +1,146 @@
+# Builds memcached for Linux (x86_64, aarch64) and macOS (Apple Silicon,
+# Intel) from the memcached.org source and publishes it on a release Phun
+# setup downloads from. memcached.org ships source only.
+#
+# libevent, memcached's one dependency, is built static and linked in, so the
+# server needs only the C library. Linux builds on Ubuntu 22.04 so the binary
+# runs on glibc 2.35 and newer, like Phun's other Linux services.
+#
+# Manual only: run it from the Actions tab. Afterwards run Phun's
+# `scripts/pin-services.sh memcached-<version>`.
+name: memcached-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: memcached version
+        default: "1.6.45"
+      sha256:
+        description: SHA-256 of memcached-<version>.tar.gz (memcached.org publishes SHA-1 only; this one matched it)
+        default: "d362c64e6d8d5287153501eabf7c85b4a761432fbf53f5d7b085d0bb1653c1dd"
+
+permissions:
+  contents: read
+
+env:
+  LIBEVENT_VERSION: "2.1.12-stable"
+  LIBEVENT_SHA256: "92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb"
+
+jobs:
+  build:
+    name: memcached ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ inputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - name: Sources (checked)
+        run: |
+          curl -fsSL --retry 3 -o memcached.tar.gz "https://memcached.org/files/memcached-$VERSION.tar.gz"
+          echo "${{ inputs.sha256 }}  memcached.tar.gz" | shasum -a 256 -c -
+          curl -fsSL --retry 3 -o libevent.tar.gz \
+            "https://github.com/libevent/libevent/releases/download/release-$LIBEVENT_VERSION/libevent-$LIBEVENT_VERSION.tar.gz"
+          echo "$LIBEVENT_SHA256  libevent.tar.gz" | shasum -a 256 -c -
+          tar -xzf memcached.tar.gz
+          tar -xzf libevent.tar.gz
+
+      - name: libevent (static)
+        working-directory: libevent-${{ env.LIBEVENT_VERSION }}
+        run: |
+          ./configure --prefix="$RUNNER_TEMP/libevent" --disable-shared --enable-static \
+            --disable-openssl --disable-samples --disable-libevent-regress --with-pic
+          make -j4
+          make install
+
+      - name: memcached
+        working-directory: memcached-${{ inputs.version }}
+        run: |
+          ./configure --prefix="$RUNNER_TEMP/install" --with-libevent="$RUNNER_TEMP/libevent" --disable-docs
+          make -j4
+          make install
+
+      - name: Stage
+        run: |
+          mkdir -p "$RUNNER_TEMP/stage/bin"
+          cp "$RUNNER_TEMP/install/bin/memcached" "$RUNNER_TEMP/stage/bin/memcached"
+          chmod 755 "$RUNNER_TEMP/stage/bin/memcached"
+
+      - name: Verify
+        run: |
+          bin="$RUNNER_TEMP/stage/bin/memcached"
+          "$bin" --version | grep -q "memcached $VERSION"
+          if [ "$(uname)" = Darwin ]; then
+            otool -L "$bin"
+            if otool -L "$bin" | tail -n +2 | grep -vE '^\s+/(usr/lib|System/Library)/'; then
+              echo "memcached links a library outside macOS"; exit 1
+            fi
+          else
+            ldd "$bin"
+            if ldd "$bin" | grep -q libevent; then echo "libevent was linked dynamically"; exit 1; fi
+          fi
+          "$bin" --listen=127.0.0.1 --port=11299 --udp-port=0 --memory-limit=16 &
+          pid=$!
+          for _ in $(seq 1 20); do
+            reply=$(printf 'version\r\nquit\r\n' | nc -w 1 127.0.0.1 11299 || true)
+            echo "$reply" | grep -q '^VERSION' && break
+            sleep 0.5
+          done
+          echo "$reply" | grep -q "^VERSION $VERSION"
+          kill "$pid"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          name="memcached-$VERSION-${{ matrix.platform }}.tar.gz"
+          tar -C "$RUNNER_TEMP/stage" -czf "dist/$name" bin
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memcached-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd dist
+          tag="memcached-$VERSION"
+          files=(memcached-"$VERSION"-*.tar.gz)
+          [ "${#files[@]}" -eq 4 ] || { echo "$tag: expected 4 archives, got ${#files[@]}"; exit 1; }
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            echo "$tag already exists on $REPO; delete it first to rebuild"; exit 1
+          fi
+          gh release create "$tag" --repo "$REPO" --title "memcached $VERSION" \
+            --notes "memcached $VERSION for Phun on Linux and macOS, built from the memcached.org source with libevent $LIBEVENT_VERSION linked in. BSD-3-Clause." \
+            "${files[@]}" SHA256SUMS
